@@ -1,22 +1,31 @@
 import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 import pandas as pd
-import sqlite3
 from datetime import datetime, date
 
-# --- CONFIGURAÇÃO E BANCO DE DADOS ---
-conn = sqlite3.connect('gestao_validade.db', check_same_thread=False)
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS equipamentos 
-              (id INTEGER PRIMARY KEY AUTOINCREMENT, nome TEXT, certificado TEXT, 
-               data_calibracao TEXT, data_vencimento TEXT)''')
-conn.commit()
-
+# Configuração da página
 st.set_page_config(page_title="Gestão Metrum - Clenio", layout="wide", page_icon="⚡")
+
+# --- CONEXÃO COM GOOGLE SHEETS ---
+# Link da sua planilha fornecida
+url = "https://docs.google.com/spreadsheets/d/1H-92JQuuSMGhJPxhs9houb4n08vVQztILIob6tQcM9U/edit?gid=0#gid=0"
+
+conn = st.connection("gsheets", type=GSheetsConnection)
+
+def carregar_dados():
+    try:
+        # ttl=0 garante que os dados sejam atualizados a cada recarregamento
+        return conn.read(spreadsheet=url, ttl=0)
+    except:
+        # Cria um DataFrame vazio com as colunas necessárias se a planilha estiver limpa
+        return pd.DataFrame(columns=["id", "nome", "certificado", "data_calibracao", "data_vencimento"])
 
 # --- SIDEBAR ---
 st.sidebar.title("⚡ METRUM")
 st.sidebar.write(f"**Técnico:** Clenio")
 st.sidebar.divider()
+
+df = carregar_dados()
 
 with st.sidebar.expander("➕ CADASTRAR EQUIPAMENTO", expanded=False):
     with st.form("cad_sidebar", clear_on_submit=True):
@@ -24,21 +33,39 @@ with st.sidebar.expander("➕ CADASTRAR EQUIPAMENTO", expanded=False):
         ce = st.text_input("Certificado")
         d_cal = st.date_input("Data da Calibração", value=date.today(), format="DD/MM/YYYY")
         d_venc = st.date_input("Data de Expiração", value=date.today(), format="DD/MM/YYYY")
+        
         if st.form_submit_button("SALVAR"):
-            c.execute("INSERT INTO equipamentos (nome, certificado, data_calibracao, data_vencimento) VALUES (?,?,?,?)",
-                      (n, ce, str(d_cal), str(d_venc)))
-            conn.commit()
+            # Lógica para gerar ID incremental
+            novo_id = int(df['id'].max() + 1) if not df.empty and 'id' in df.columns else 1
+            
+            nova_linha = pd.DataFrame([{
+                "id": novo_id, 
+                "nome": n, 
+                "certificado": ce, 
+                "data_calibracao": str(d_cal), 
+                "data_vencimento": str(d_venc)
+            }])
+            
+            # Remove colunas auxiliares antes de salvar para não sujar a planilha
+            df_para_salvar = df.copy()
+            if 'data_vencimento_dt' in df_para_salvar.columns:
+                df_para_salvar = df_para_salvar.drop(columns=['data_vencimento_dt', 'dias_restantes'])
+            
+            df_atualizado = pd.concat([df_para_salvar, nova_linha], ignore_index=True)
+            conn.update(spreadsheet=url, data=df_atualizado)
+            st.success("Equipamento cadastrado com sucesso!")
             st.rerun()
 
 # --- PAINEL PRINCIPAL ---
 st.title("🛡️ Controle de Validade")
 
-df = pd.read_sql_query("SELECT * FROM equipamentos", conn)
-
-if not df.empty:
+if not df.empty and 'data_vencimento' in df.columns:
+    # Conversão para formato de data e cálculo de prazos
     df['data_vencimento_dt'] = pd.to_datetime(df['data_vencimento']).dt.date
     hoje = date.today()
     df['dias_restantes'] = df['data_vencimento_dt'].apply(lambda x: (x - hoje).days)
+    
+    # Ordenação: mais urgentes primeiro
     df = df.sort_values(by='dias_restantes', ascending=True)
 
     # --- DASHBOARD SUPERIOR ---
@@ -57,10 +84,11 @@ if not df.empty:
 
     busca = st.text_input("🔍 Pesquisar na tabela:", placeholder="Nome ou certificado...")
     if busca:
-        df = df[df['certificado'].str.contains(busca, case=False) | df['nome'].str.contains(busca, case=False)]
+        df = df[df['certificado'].astype(str).str.contains(busca, case=False) | df['nome'].str.contains(busca, case=False)]
 
     st.subheader("📋 Lista de Prioridades")
 
+    # Cabeçalho da Tabela
     c_head = st.columns([2, 2, 1.5, 1.5, 1, 1.2])
     c_head[0].write("**Equipamento**")
     c_head[1].write("**Certificado**")
@@ -70,6 +98,7 @@ if not df.empty:
     c_head[5].write("**Ações**")
     st.divider()
 
+    # Linhas da Tabela
     for index, row in df.iterrows():
         if row['dias_restantes'] < 0:
             status_txt, cor = "❌ VENCIDO", "#ff4b4b"
@@ -87,43 +116,13 @@ if not df.empty:
         r[3].write(prazo_txt)
         r[4].markdown(f"<span style='color:{cor}; font-weight:bold'>{status_txt}</span>", unsafe_allow_html=True)
         
-        c_edit, c_del = r[5].columns(2)
-        if c_edit.button("📝", key=f"btn_edit_{row['id']}"):
-            st.session_state[f"edit_{row['id']}"] = True
-        if c_del.button("🗑️", key=f"btn_del_{row['id']}"):
-            st.session_state[f"del_confirm_{row['id']}"] = True
+        # Ação de Excluir
+        if r[5].button("🗑️", key=f"del_{row['id']}"):
+            df_base = carregar_dados() # Lê a versão limpa do banco
+            df_pos_del = df_base[df_base['id'].astype(int) != int(row['id'])]
+            conn.update(spreadsheet=url, data=df_pos_del)
+            st.rerun()
 
-        if st.session_state.get(f"edit_{row['id']}", False):
-            with st.form(key=f"form_edit_{row['id']}"):
-                st.write(f"🔧 **Atualizar:** {row['nome']}")
-                f1, f2, f3 = st.columns([2, 1, 1])
-                novo_cert = f1.text_input("Novo Certificado", value=row['certificado'])
-                data_cal_padrao = datetime.strptime(row['data_calibracao'], '%Y-%m-%d').date()
-                nova_data_cal = f2.date_input("Nova Data de Calibração", value=data_cal_padrao, format="DD/MM/YYYY")
-                nova_data_venc = f3.date_input("Nova Data de Expiração", value=row['data_vencimento_dt'], format="DD/MM/YYYY")
-                
-                b1, b2 = st.columns([1, 6])
-                if b1.form_submit_button("✅ Salvar"):
-                    c.execute("UPDATE equipamentos SET certificado=?, data_calibracao=?, data_vencimento=? WHERE id=?", 
-                              (novo_cert, str(nova_data_cal), str(nova_data_venc), row['id']))
-                    conn.commit()
-                    st.session_state[f"edit_{row['id']}"] = False
-                    st.rerun()
-                if b2.form_submit_button("❌ Sair"):
-                    st.session_state[f"edit_{row['id']}"] = False
-                    st.rerun()
-
-        if st.session_state.get(f"del_confirm_{row['id']}", False):
-            with st.container(border=True):
-                st.warning(f"Excluir **{row['nome']}**?")
-                col_sim, col_nao = st.columns([1, 8])
-                if col_sim.button("Sim, excluir", key=f"conf_sim_{row['id']}"):
-                    c.execute("DELETE FROM equipamentos WHERE id=?", (row['id'],))
-                    conn.commit()
-                    st.rerun()
-                if col_nao.button("Não", key=f"conf_nao_{row['id']}"):
-                    st.session_state[f"del_confirm_{row['id']}"] = False
-                    st.rerun()
         st.write("---")
 else:
-    st.info("Nenhum equipamento cadastrado, Clenio.")
+    st.info("Aguardando o primeiro cadastro de equipamento, Clenio.")
